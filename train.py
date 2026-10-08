@@ -147,14 +147,14 @@ class Config:
     batch_size: int = 8
     lr: float = 1e-3
     weight_decay: float = 1e-4
-    epochs: int = 60
-    patience: int = 15
+    epochs: int = 300
+    patience: int = 30
     warmup_frac: float = 0.05         # LR warm-up fraction of total steps
     grad_clip: float = 1.0
     wet_weight: float = 4.0           # extra loss weight on wet cells
     amp: bool = True
-    seed: int = 0
-    num_workers: int = 0
+    seed: int = 114
+    num_workers: int = os.cpu_count() // 2
 
     # rollout curriculum / teacher forcing
     curriculum: tuple = (2, 4, 8, 12)

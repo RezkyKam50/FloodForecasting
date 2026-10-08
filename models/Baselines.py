@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .ForecasterBlock import _AutoregressiveForecaster, make_norm, OutputHead, _coord_grid
+from .ForecasterBlock import _AutoregressiveForecaster
  
 def make_norm(kind, ch):
     if kind == "batch":
