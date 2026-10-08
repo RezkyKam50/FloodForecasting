@@ -153,8 +153,8 @@ class Config:
     grad_clip: float = 1.0
     wet_weight: float = 4.0           # extra loss weight on wet cells
     amp: bool = True
-    seed: int = 114
-    num_workers: int = os.cpu_count() // 2
+    seed: int = 0
+    num_workers: int = 0
 
     # rollout curriculum / teacher forcing
     curriculum: tuple = (2, 4, 8, 12)
@@ -1799,6 +1799,18 @@ def parse_args():
 
 
 def main():
+    # cuda determinism
+    random.seed(Config.seed)
+    torch.manual_seed(Config.seed)
+    np.random.seed(Config.seed)
+
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:
+        print("WARNING: no CUDA GPU found - may differ.")
+
+
     global MAX_HOURS, SHOW_PLOTS, DATA_ROOT
     args = parse_args()
     MAX_HOURS, SHOW_PLOTS, DATA_ROOT = args.max_hours, args.show_plots, args.data_root
