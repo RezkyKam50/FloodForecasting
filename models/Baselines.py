@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from .ForecasterBlock import _AutoregressiveForecaster, make_norm, OutputHead, _coord_grid
  
 def make_norm(kind, ch):
     if kind == "batch":
@@ -32,66 +32,8 @@ def _coord_grid(b, h, w, device, dtype):
     return torch.cat([gy, gx], 1)
 
  
-class _AutoregressiveForecaster(nn.Module):
-    """Handles windowing, residual bases and teacher forcing. Subclasses define `_predict`."""
-    DYN_CH = 2  # depth + rain
 
-    def __init__(self, n_static, t_in=4, use_future_rain=True, residual=True, rain_zero_z=0.0,
-                 residual_base="persistence", velocity_clip=3.0):
-        super().__init__()
-        self.n_static, self.t_in = n_static, int(t_in)
-        self.use_future_rain, self.residual = use_future_rain, residual
-        self.residual_base, self.velocity_clip = residual_base, float(velocity_clip)
-        self.rain_zero_z = float(rain_zero_z)
-        self.in_ch = self.DYN_CH * self.t_in + n_static
-
-    def _predict(self, x):  # (B, in_ch, H, W) -> (B, 1, H, W)
-        raise NotImplementedError
-
-    def _fit(self, seq):
-        """(B, T, H, W) -> last t_in frames, left-padded by repeating the first frame."""
-        T = seq.shape[1]
-        if T >= self.t_in:
-            return seq[:, -self.t_in:]
-        return torch.cat([seq[:, :1].expand(-1, self.t_in - T, -1, -1), seq], 1)
-
-    def forward(self, depth_hist, rain_hist, rain_fut, static, out_steps=None, teacher=None, tf_prob=0.0):
-        B, Tin, _, h, w = depth_hist.shape
-        K = out_steps or rain_fut.shape[1]
-
-        d_win = self._fit(depth_hist[:, :, 0])
-        r_hist = self._fit(rain_hist[:, :, 0])
-        if self.use_future_rain:
-            r_fut = rain_fut[:, :K, 0]
-        else:
-            r_fut = torch.full((B, K, h, w), self.rain_zero_z, device=d_win.device, dtype=d_win.dtype)
-        rain_all = torch.cat([r_hist, r_fut], 1)  # window for step k = rain_all[:, k+1 : k+1+t_in]
-
-        cur, outs = depth_hist[:, -1], []
-        prev = depth_hist[:, -2] if Tin > 1 else cur
-        for k in range(K):
-            parts = [d_win, rain_all[:, k + 1:k + 1 + self.t_in]]
-            if self.n_static:
-                parts.append(static)
-            d = self._predict(torch.cat(parts, 1))
-            if self.residual and self.residual_base == "velocity":
-                nxt = cur + (cur - prev).clamp(-self.velocity_clip, self.velocity_clip) + d
-            else:
-                nxt = cur + d if self.residual else d
-            outs.append(nxt)
-            if teacher is not None and k < K - 1 and tf_prob > 0:
-                m = (torch.rand(B, 1, 1, 1, device=cur.device) < tf_prob).to(cur.dtype)
-                new = m * teacher[:, k] + (1 - m) * nxt
-            else:
-                new = nxt
-            prev, cur = cur, new
-            d_win = torch.cat([d_win[:, 1:], cur], 1)
-        return torch.stack(outs, 1)
-
-
-# --------------------------------------------------------------------------- #
-# UNet
-# --------------------------------------------------------------------------- #
+ 
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch, k, norm):
         super().__init__()
@@ -104,8 +46,6 @@ class ConvBlock(nn.Module):
 
 
 class PlainUNet(_AutoregressiveForecaster):
-    """Classic UNet encoder-decoder; widths = hidden * 2**level."""
-
     def __init__(self, n_static, hidden=32, kernel=3, norm="none", head_width=32, use_future_rain=True,
                  residual=True, rain_zero_z=0.0, residual_base="persistence", velocity_clip=3.0,
                  t_in=4, levels=3):
@@ -138,11 +78,7 @@ class PlainUNet(_AutoregressiveForecaster):
         for i in reversed(range(self.levels)):
             x = self.dec[i](torch.cat([self.up[i](x), skips[i]], 1))
         return self.head(x)[..., :H, :W]
-
-
-# --------------------------------------------------------------------------- #
-# FNO
-# --------------------------------------------------------------------------- #
+ 
 class SpectralConv2d(nn.Module):
     def __init__(self, in_ch, out_ch, modes1, modes2):
         super().__init__()
@@ -172,8 +108,6 @@ class SpectralConv2d(nn.Module):
 
 
 class PlainFNO(_AutoregressiveForecaster):
-    """Vanilla FNO: lift -> n_layers x (spectral + 1x1 bypass, GELU) -> OutputHead."""
-
     def __init__(self, n_static, hidden=32, kernel=3, norm="none", head_width=32, use_future_rain=True,
                  residual=True, rain_zero_z=0.0, residual_base="persistence", velocity_clip=3.0,
                  t_in=4, modes=12, n_layers=4, pad=8, use_grid=True):
@@ -200,11 +134,7 @@ class PlainFNO(_AutoregressiveForecaster):
         if self.pad:
             x = x[..., :H, :W]
         return self.head(x)
-
-
-# --------------------------------------------------------------------------- #
-# FNO+ (assumed definition, see module docstring)
-# --------------------------------------------------------------------------- #
+ 
 class FNOPlusBlock(nn.Module):
     def __init__(self, ch, modes, kernel, norm, mlp_ratio):
         super().__init__()
@@ -220,8 +150,6 @@ class FNOPlusBlock(nn.Module):
 
  
 class PlainFNOPlus(_AutoregressiveForecaster):
-    """FNO+: pre-norm residual Fourier blocks with a local conv bypass and channel MLP."""
-
     def __init__(self, n_static, hidden=32, kernel=3, norm="group", head_width=32, use_future_rain=True,
                  residual=True, rain_zero_z=0.0, residual_base="persistence", velocity_clip=3.0,
                  t_in=4, modes=12, n_layers=4, pad=8, use_grid=True, mlp_ratio=2):
@@ -248,12 +176,10 @@ class PlainFNOPlus(_AutoregressiveForecaster):
 
 
 MODELS = {"unet": PlainUNet, "fno": PlainFNO, "fno_plus": PlainFNOPlus}
-
-
 def build_model(name, n_static, **kw):
     return MODELS[name.lower()](n_static, **kw)
 
-
+# smoke test
 if __name__ == "__main__":
     B, Tin, K, H, W, S = 2, 4, 3, 50, 70, 3   # deliberately not divisible by 2**levels
     args = (torch.randn(B, Tin, 1, H, W), torch.randn(B, Tin, 1, H, W),
