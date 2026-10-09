@@ -3,7 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .ForecasterBlock import _AutoregressiveForecaster
+from .ForecasterBlock import AutoregressiveForecaster
  
 def make_norm(kind, ch):
     if kind == "batch":
@@ -32,8 +32,6 @@ def _coord_grid(b, h, w, device, dtype):
     return torch.cat([gy, gx], 1)
 
  
-
- 
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch, k, norm):
         super().__init__()
@@ -45,15 +43,18 @@ class ConvBlock(nn.Module):
         return self.net(x)
 
 
-class PlainUNet(_AutoregressiveForecaster):
+class PlainUNet(nn.Module):
     def __init__(self, n_static, hidden=32, kernel=3, norm="none", head_width=32, use_future_rain=True,
                  residual=True, rain_zero_z=0.0, residual_base="persistence", velocity_clip=3.0,
                  t_in=4, levels=3):
-        super().__init__(n_static, t_in, use_future_rain, residual, rain_zero_z, residual_base, velocity_clip)
+        super().__init__()
+        self.forecaster = AutoregressiveForecaster(
+            n_static, t_in, use_future_rain, residual, rain_zero_z,
+            residual_base, velocity_clip)
         self.levels = levels
         chs = [hidden * 2 ** i for i in range(levels + 1)]
         self.enc = nn.ModuleList()
-        c = self.in_ch
+        c = self.forecaster.in_ch
         for i in range(levels):
             self.enc.append(ConvBlock(c, chs[i], kernel, norm))
             c = chs[i]
@@ -78,7 +79,14 @@ class PlainUNet(_AutoregressiveForecaster):
         for i in reversed(range(self.levels)):
             x = self.dec[i](torch.cat([self.up[i](x), skips[i]], 1))
         return self.head(x)[..., :H, :W]
- 
+
+    def forward(self, depth_hist, rain_hist, rain_fut, static,
+                out_steps=None, teacher=None, tf_prob=0.0, prior=None):
+        return self.forecaster.rollout(
+            self._predict, depth_hist, rain_hist, rain_fut, static,
+            out_steps, teacher, tf_prob, prior)
+
+
 class SpectralConv2d(nn.Module):
     def __init__(self, in_ch, out_ch, modes1, modes2):
         super().__init__()
@@ -107,13 +115,16 @@ class SpectralConv2d(nn.Module):
         return y.to(dtype)
 
 
-class PlainFNO(_AutoregressiveForecaster):
+class PlainFNO(nn.Module):
     def __init__(self, n_static, hidden=32, kernel=3, norm="none", head_width=32, use_future_rain=True,
                  residual=True, rain_zero_z=0.0, residual_base="persistence", velocity_clip=3.0,
                  t_in=4, modes=12, n_layers=4, pad=8, use_grid=True):
-        super().__init__(n_static, t_in, use_future_rain, residual, rain_zero_z, residual_base, velocity_clip)
+        super().__init__()
+        self.forecaster = AutoregressiveForecaster(
+            n_static, t_in, use_future_rain, residual, rain_zero_z,
+            residual_base, velocity_clip)
         self.pad, self.use_grid = pad, use_grid
-        self.lift = nn.Conv2d(self.in_ch + (2 if use_grid else 0), hidden, 1)
+        self.lift = nn.Conv2d(self.forecaster.in_ch + (2 if use_grid else 0), hidden, 1)
         self.spec = nn.ModuleList([SpectralConv2d(hidden, hidden, modes, modes) for _ in range(n_layers)])
         self.skip = nn.ModuleList([nn.Conv2d(hidden, hidden, 1) for _ in range(n_layers)])
         self.norms = nn.ModuleList([make_norm(norm, hidden) for _ in range(n_layers)])
@@ -134,7 +145,14 @@ class PlainFNO(_AutoregressiveForecaster):
         if self.pad:
             x = x[..., :H, :W]
         return self.head(x)
- 
+
+    def forward(self, depth_hist, rain_hist, rain_fut, static,
+                out_steps=None, teacher=None, tf_prob=0.0, prior=None):
+        return self.forecaster.rollout(
+            self._predict, depth_hist, rain_hist, rain_fut, static,
+            out_steps, teacher, tf_prob, prior)
+
+
 class FNOPlusBlock(nn.Module):
     def __init__(self, ch, modes, kernel, norm, mlp_ratio):
         super().__init__()
@@ -149,13 +167,16 @@ class FNOPlusBlock(nn.Module):
         return x + self.mlp(self.n2(x))
 
  
-class PlainFNOPlus(_AutoregressiveForecaster):
+class PlainFNOPlus(nn.Module):
     def __init__(self, n_static, hidden=32, kernel=3, norm="group", head_width=32, use_future_rain=True,
                  residual=True, rain_zero_z=0.0, residual_base="persistence", velocity_clip=3.0,
                  t_in=4, modes=12, n_layers=4, pad=8, use_grid=True, mlp_ratio=2):
-        super().__init__(n_static, t_in, use_future_rain, residual, rain_zero_z, residual_base, velocity_clip)
+        super().__init__()
+        self.forecaster = AutoregressiveForecaster(
+            n_static, t_in, use_future_rain, residual, rain_zero_z,
+            residual_base, velocity_clip)
         self.pad, self.use_grid = pad, use_grid
-        self.lift = nn.Sequential(nn.Conv2d(self.in_ch + (2 if use_grid else 0), hidden, 1), nn.GELU(),
+        self.lift = nn.Sequential(nn.Conv2d(self.forecaster.in_ch + (2 if use_grid else 0), hidden, 1), nn.GELU(),
                                   nn.Conv2d(hidden, hidden, 1))
         self.blocks = nn.ModuleList([FNOPlusBlock(hidden, modes, kernel, norm, mlp_ratio) for _ in range(n_layers)])
         self.out_norm = make_norm(norm, hidden)
@@ -173,6 +194,12 @@ class PlainFNOPlus(_AutoregressiveForecaster):
         if self.pad:
             x = x[..., :H, :W]
         return self.head(self.out_norm(x))
+
+    def forward(self, depth_hist, rain_hist, rain_fut, static,
+                out_steps=None, teacher=None, tf_prob=0.0, prior=None):
+        return self.forecaster.rollout(
+            self._predict, depth_hist, rain_hist, rain_fut, static,
+            out_steps, teacher, tf_prob, prior)
 
 
 MODELS = {"unet": PlainUNet, "fno": PlainFNO, "fno_plus": PlainFNOPlus}
